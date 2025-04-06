@@ -15,3 +15,24 @@ loguru>=0.6.0
 pytest>=7.3.1
 pytest-asyncio>=0.21.0
 aiohttp>=3.8.4
+lxml-html-clean>=0.4.0
+
+# New dependencies for AI features
+transformers>=4.30.0
+torch>=2.0.0
+sentencepiece>=0.1.99
+yake>=0.4.8
+rake-nltk>=1.0.6
+scikit-learn>=1.2.2
+spacy>=3.5.3
+python-dotenv>=1.0.0
+
+# MongoDB
+motor>=3.1.2
+pymongo>=4.3.3
+
+# Optional: for image processing
+pillow>=9.5.0
+
+# Optional: for caching
+redis>=4.5.5

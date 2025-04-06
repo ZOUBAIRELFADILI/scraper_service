@@ -1,84 +1,61 @@
-# Scraper Service
+# AI-Powered Content Intelligence Service
 
-A FastAPI microservice for web scraping that extracts articles from various websites with multiple fallback mechanisms for resilience.
+A complete FastAPI microservice for scraping, enriching, and analyzing articles from websites with AI capabilities.
 
 ## Features
 
-- Scrapes articles from any website URL
-- Extracts all articles from listing pages (like news homepages)
-- Uses multiple fallback libraries for increased accuracy and resilience:
-  - newspaper3k
-  - trafilatura
-  - goose3
-  - readability-lxml
-  - BeautifulSoup (as last resort)
-- Supports JavaScript-rendered websites using Playwright
-- Detects and returns content language
-- Cleans text by removing ads, navbars, scripts, and boilerplate
-- Handles errors gracefully for unreachable, blocked, or malformed URLs
-- Asynchronous architecture for improved performance
-- CORS middleware for cross-origin requests
-- Comprehensive logging
+- **Advanced Web Scraping**: Extract articles from any website with multiple fallback mechanisms
+- **NLP Enrichment**: Generate summaries and extract keywords using transformer models
+- **Fake News Detection**: Classify articles using a transformer-based fake news detector
+- **Date Filtering**: Only keep articles published within the last 6 months
+- **Image & Logo Extraction**: Extract images and website logos from articles
+- **MongoDB Integration**: Store articles with proper schema and deduplication
+- **Search Capabilities**: Search stored articles by content, title, or keywords
+- **Responsive API**: Clean, well-documented API with proper error handling
+- **CORS Support**: Ready for cross-origin requests
+- **Comprehensive Logging**: Detailed logs for debugging and monitoring
 
-## Installation
-
-### Prerequisites
-
-- Python 3.10+
-- pip
-
-### Setup
-
-1. Clone the repository:
-
-```bash
-git clone https://github.com/yourusername/scraper-service.git
-cd scraper-service
-```
-
-2. Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-3. Install Playwright browsers:
-
-```bash
-playwright install chromium
-```
-
-## Usage
-
-### Running the Service
-
-Start the service with uvicorn:
-
-```bash
-cd scraper-service
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-The API will be available at http://localhost:8000
-
-### API Endpoints
-
-#### Health Check
+## Architecture
 
 ```
-GET /health
+scraper_service/
+├── app/
+│   ├── core/
+│   │   └── scraper.py         # Enhanced scraper with image extraction
+│   ├── db/
+│   │   └── mongodb.py         # MongoDB client for storing articles
+│   ├── fakenews/
+│   │   └── detector.py        # Fake news detection using transformers
+│   ├── models/
+│   │   └── schemas.py         # Pydantic models for requests/responses
+│   ├── nlp/
+│   │   └── enrichment.py      # NLP enrichment (summarization, keywords)
+│   ├── routers/
+│   │   └── scraper.py         # API routes for scraping and searching
+│   ├── utils/
+│   │   ├── date_filters/      # Date filtering utilities
+│   │   ├── url_cleaners/      # URL normalization utilities
+│   │   └── helpers.py         # General helper functions
+│   ├── main.py                # FastAPI app configuration
+│   └── pipeline.py            # Orchestrates the entire workflow
+├── tests/
+│   ├── test_api.py            # API endpoint tests
+│   ├── test_scraper.py        # Core scraper tests
+│   └── test_enhanced_service.py # Tests for AI features
+├── run.py                     # Service entry point
+├── requirements.txt           # Dependencies
+├── Dockerfile                 # Container configuration
+├── docker-compose.yml         # Container orchestration
+└── .env                       # Environment variables (not in repo)
 ```
 
-Returns the status of the service.
+## API Endpoints
 
-#### Scrape Articles
+### POST /scrape
 
-```
-POST /scrape
-```
+Scrape and enrich articles from a list of URLs.
 
-Request body:
-
+**Request:**
 ```json
 {
   "urls": [
@@ -89,121 +66,168 @@ Request body:
 }
 ```
 
-Response:
-
+**Response:**
 ```json
 {
   "articles": [
     {
       "title": "Article Title",
       "content": "Full cleaned text content",
-      "publication_date": "2024-11-05",
+      "summary": "AI-generated summary",
+      "keywords": ["ai", "scraping", "nlp"],
+      "image_urls": ["https://example.com/image1.jpg"],
+      "logo_url": "https://example.com/logo.png",
+      "publication_date": "2024-11-05T10:30:00",
+      "scraped_at": "2024-04-06T14:12:00",
+      "language": "en",
       "url": "https://example.com/article-url",
-      "language": "en"
-    },
-    ...
+      "source_domain": "example.com",
+      "is_fake_news": false,
+      "confidence_score": 0.91
+    }
   ],
   "errors": [
     {
-      "url": "https://blocked-site.com",
-      "error": "Error message",
-      "traceback": "Detailed error traceback"
-    },
-    ...
+      "url": "https://invalid-url.com",
+      "error": "Error description",
+      "traceback": "Error traceback"
+    }
   ]
 }
 ```
 
-### Example Usage with Python
+### GET /articles
 
-```python
-import requests
+Search for articles in the database.
 
-# API endpoint
-url = "http://localhost:8000/scrape"
+**Parameters:**
+- `q` (required): Search query string
+- `limit` (optional): Maximum number of results to return (default: 10)
+- `skip` (optional): Number of results to skip for pagination (default: 0)
 
-# Request payload
-payload = {
-    "urls": [
-        "https://techcrunch.com",
-        "https://example.com"
-    ]
+**Response:**
+```json
+{
+  "articles": [
+    {
+      "title": "Article Title",
+      "content": "Full cleaned text content",
+      "summary": "AI-generated summary",
+      "keywords": ["ai", "scraping", "nlp"],
+      "image_urls": ["https://example.com/image1.jpg"],
+      "logo_url": "https://example.com/logo.png",
+      "publication_date": "2024-11-05T10:30:00",
+      "scraped_at": "2024-04-06T14:12:00",
+      "language": "en",
+      "url": "https://example.com/article-url",
+      "source_domain": "example.com",
+      "is_fake_news": false,
+      "confidence_score": 0.91
+    }
+  ],
+  "total": 42,
+  "page": 1,
+  "total_pages": 5
 }
-
-# Send POST request
-response = requests.post(url, json=payload)
-
-# Check if request was successful
-if response.status_code == 200:
-    data = response.json()
-    
-    # Process articles
-    for article in data["articles"]:
-        print(f"Title: {article['title']}")
-        print(f"URL: {article['url']}")
-        print(f"Language: {article['language']}")
-        print(f"Publication Date: {article['publication_date']}")
-        print(f"Content (first 150 chars): {article['content'][:150]}...")
-        print("\n")
-    
-    # Process errors
-    for error in data["errors"]:
-        print(f"Error for URL {error['url']}: {error['error']}")
-else:
-    print(f"Error: {response.status_code} - {response.text}")
 ```
 
-### Example Usage with cURL
+### GET /health
+
+Health check endpoint.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "version": "2.0.0"
+}
+```
+
+## Installation
+
+### Prerequisites
+
+- Python 3.10+
+- MongoDB database
+- Sufficient disk space for AI models (at least 5GB recommended)
+
+### Setup
+
+1. Clone the repository:
+```bash
+git clone https://github.com/ZOUBAIRELFADILI/scraper_service.git
+cd scraper_service
+```
+
+2. Create a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+4. Install Playwright browsers:
+```bash
+playwright install chromium
+```
+
+5. Create a `.env` file with your MongoDB connection string:
+```
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority
+DB_NAME=scraper_db
+COLLECTION_NAME=articles
+```
+
+6. Run the service:
+```bash
+python run.py
+```
+
+The service will be available at http://localhost:8000.
+
+## Docker Deployment
+
+1. Build and run with Docker Compose:
+```bash
+docker-compose up -d
+```
+
+2. The service will be available at http://localhost:8000.
+
+## System Requirements
+
+- **CPU**: 4+ cores recommended for parallel scraping
+- **RAM**: 8GB+ (16GB+ recommended for large transformer models)
+- **Disk**: 5GB+ for AI models and dependencies
+- **Network**: Stable internet connection for scraping and API access
+
+## Development
+
+### Running Tests
 
 ```bash
-curl -X 'POST' \
-  'http://localhost:8000/scrape' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "urls": [
-    "https://techcrunch.com",
-    "https://example.com"
-  ]
-}'
+pytest tests/
 ```
 
-## Project Structure
+### API Documentation
 
-```
-scraper-service/
-├── app/
-│   ├── core/
-│   │   └── scraper.py         # Core scraping logic
-│   ├── models/
-│   │   └── schemas.py         # Pydantic models
-│   ├── routers/
-│   │   └── scraper.py         # API routes
-│   ├── utils/
-│   │   └── helpers.py         # Utility functions
-│   └── main.py                # FastAPI app
-├── tests/
-│   ├── test_api.py            # API tests
-│   └── test_scraper.py        # Scraper tests
-├── logs/                      # Log files
-├── requirements.txt           # Dependencies
-└── README.md                  # Documentation
-```
-
-## Future Enhancements
-
-- NLP pipeline for summarization and keyword extraction
-- Fake news detection using a transformer model
-- Article rating or scoring
-- Caching mechanism for improved performance
-- Rate limiting to prevent abuse
-- Authentication for API access
-- Docker containerization
+When the service is running, visit:
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
 ## License
 
 MIT
 
-## Contributing
+## Acknowledgements
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+This project uses several open-source libraries:
+- FastAPI for the API framework
+- Newspaper3k, Trafilatura, and Goose3 for article extraction
+- Transformers and PyTorch for NLP models
+- Motor and PyMongo for MongoDB integration
+- Playwright for JavaScript-rendered websites

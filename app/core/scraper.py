@@ -1,16 +1,15 @@
-# Core scraper module with multiple fallback mechanisms
+"""
+Enhanced core scraper module with support for extracting images and logos.
+"""
 import asyncio
-from typing import List, Dict, Any, Optional, Tuple
 import traceback
-from urllib.parse import urljoin
-import re
-from datetime import datetime
-
-# Import scraping libraries
+from typing import List, Dict, Any, Tuple, Optional
+from urllib.parse import urlparse
 import newspaper
 from newspaper import Article as NewspaperArticle
-from trafilatura import fetch_url, extract
+from newspaper.article import ArticleException
 from goose3 import Goose
+from trafilatura import fetch_url, extract
 from readability import Document
 from bs4 import BeautifulSoup
 import langdetect
@@ -18,24 +17,21 @@ import langid
 from loguru import logger
 from playwright.async_api import async_playwright
 
-# Import custom models
-from app.models.schemas import Article
+from app.utils.url_cleaners.normalizer import normalize_url, extract_domain
 
 
 class Scraper:
     """
-    Core scraper class with multiple fallback mechanisms for article extraction.
+    Enhanced scraper with multiple fallback mechanisms and support for extracting images and logos.
     """
     
     def __init__(self):
-        """Initialize the scraper with necessary configurations."""
-        self.goose = Goose()
-        
-    async def close(self):
-        """Close any resources when done."""
-        self.goose.close()
+        """Initialize the scraper with necessary components."""
+        logger.info("Initializing enhanced scraper")
+        self.playwright = None
+        self.browser = None
     
-    async def scrape_urls(self, urls: List[str]) -> Tuple[List[Article], List[Dict[str, Any]]]:
+    async def scrape_urls(self, urls: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Scrape articles from a list of URLs.
         
@@ -43,487 +39,578 @@ class Scraper:
             urls: List of URLs to scrape
             
         Returns:
-            Tuple containing list of scraped articles and list of errors
+            Tuple of (articles, errors)
         """
         articles = []
         errors = []
         
-        # Create tasks for each URL
-        tasks = [self.process_url(url) for url in urls]
+        # Initialize playwright browser if not already initialized
+        if not self.browser:
+            await self._init_browser()
+        
+        # Process URLs concurrently
+        tasks = [self.scrape_url(url) for url in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Process results
         for url, result in zip(urls, results):
             if isinstance(result, Exception):
+                # Handle exception
                 logger.error(f"Error scraping {url}: {str(result)}")
                 errors.append({
                     "url": url,
-                    "error": str(result),
+                    "error": f"Error: {str(result)}",
                     "traceback": traceback.format_exc()
                 })
-            elif result:
-                articles.extend(result)
+            elif isinstance(result, tuple) and len(result) == 2:
+                # Unpack result
+                url_articles, url_errors = result
+                
+                # Add articles
+                articles.extend(url_articles)
+                
+                # Add errors
+                errors.extend(url_errors)
             else:
+                # Unexpected result
+                logger.error(f"Unexpected result for {url}: {result}")
                 errors.append({
                     "url": url,
-                    "error": "No articles found or unable to parse content",
+                    "error": f"Unexpected result: {result}",
                     "traceback": None
                 })
-                
+        
         return articles, errors
     
-    async def process_url(self, url: str) -> List[Article]:
+    async def scrape_url(self, url: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
-        Process a single URL to extract articles.
+        Scrape articles from a single URL.
         
         Args:
-            url: URL to process
+            url: URL to scrape
             
         Returns:
-            List of extracted articles
-        """
-        try:
-            # First, check if it's a listing page with multiple articles
-            articles = await self.extract_articles_from_listing(url)
-            if articles:
-                return articles
-            
-            # If not a listing or no articles found, try to extract as a single article
-            article = await self.extract_single_article(url)
-            return [article] if article else []
-            
-        except Exception as e:
-            logger.error(f"Error processing {url}: {str(e)}")
-            raise
-    
-    async def extract_articles_from_listing(self, url: str) -> List[Article]:
-        """
-        Extract articles from a listing page (e.g., homepage, category page).
-        
-        Args:
-            url: URL of the listing page
-            
-        Returns:
-            List of extracted articles
+            Tuple of (articles, errors)
         """
         articles = []
+        errors = []
         
         try:
-            # Try newspaper3k first for listing pages
-            news_site = newspaper.build(url, memoize_articles=False)
+            # Normalize URL
+            normalized_url = normalize_url(url)
+            if not normalized_url:
+                raise ValueError(f"Invalid URL: {url}")
             
-            # If no article URLs found, this might not be a listing page
-            if len(news_site.article_urls()) == 0:
-                return []
+            # Try to build a newspaper source to check if it's a listing page
+            source = newspaper.build(normalized_url, memoize_articles=False)
+            
+            if len(source.articles) > 1:
+                # It's a listing page, scrape all articles
+                logger.info(f"Found {len(source.articles)} articles on {normalized_url}")
                 
-            # Process each article URL
-            article_tasks = []
-            for article_url in news_site.article_urls():
-                article_tasks.append(self.extract_single_article(article_url))
-            
-            # Gather results
-            article_results = await asyncio.gather(*article_tasks, return_exceptions=True)
-            
-            # Filter successful results
-            for result in article_results:
-                if isinstance(result, Article):
-                    articles.append(result)
-                    
-            return articles
-            
+                # Process articles concurrently
+                tasks = [self._scrape_article(article.url, normalized_url) for article in source.articles[:10]]  # Limit to 10 articles
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                for article_url, result in zip([a.url for a in source.articles[:10]], results):
+                    if isinstance(result, Exception):
+                        # Handle exception
+                        logger.error(f"Error scraping article {article_url}: {str(result)}")
+                        errors.append({
+                            "url": article_url,
+                            "error": f"Error: {str(result)}",
+                            "traceback": traceback.format_exc()
+                        })
+                    elif result:
+                        # Add article
+                        articles.append(result)
+            else:
+                # It's a single article, scrape it
+                article = await self._scrape_article(normalized_url)
+                if article:
+                    articles.append(article)
+        
         except Exception as e:
-            logger.warning(f"Failed to extract articles from listing {url} using newspaper3k: {str(e)}")
-            
-            # Fallback: Try to extract article links using BeautifulSoup
-            try:
-                html = await self._fetch_html_with_js_rendering(url)
-                if not html:
-                    return []
-                    
-                soup = BeautifulSoup(html, 'html.parser')
-                article_links = []
-                
-                # Look for common article link patterns
-                for a_tag in soup.find_all('a', href=True):
-                    href = a_tag['href']
-                    # Convert relative URLs to absolute
-                    if not href.startswith(('http://', 'https://')):
-                        href = urljoin(url, href)
-                    
-                    # Check if URL likely points to an article
-                    if self._is_likely_article_url(href):
-                        article_links.append(href)
-                
-                # Process each article URL
-                article_tasks = []
-                for article_url in set(article_links):  # Remove duplicates
-                    article_tasks.append(self.extract_single_article(article_url))
-                
-                # Gather results
-                if article_tasks:
-                    article_results = await asyncio.gather(*article_tasks, return_exceptions=True)
-                    
-                    # Filter successful results
-                    for result in article_results:
-                        if isinstance(result, Article) and not isinstance(result, Exception):
-                            articles.append(result)
-                
-                return articles
-                
-            except Exception as fallback_e:
-                logger.error(f"Fallback extraction also failed for {url}: {str(fallback_e)}")
-                return []
+            # Handle exception
+            logger.error(f"Error scraping {url}: {str(e)}")
+            errors.append({
+                "url": url,
+                "error": f"Error: {str(e)}",
+                "traceback": traceback.format_exc()
+            })
+        
+        return articles, errors
     
-    async def extract_single_article(self, url: str) -> Optional[Article]:
+    async def _scrape_article(self, url: str, base_url: str = None) -> Optional[Dict[str, Any]]:
         """
-        Extract a single article from a URL using multiple fallback mechanisms.
+        Scrape a single article using multiple fallback mechanisms.
         
         Args:
-            url: URL of the article
+            url: URL of the article to scrape
+            base_url: Base URL for resolving relative URLs
             
         Returns:
-            Extracted article or None if extraction failed
+            Article data or None if scraping fails
         """
-        # Try multiple extraction methods in sequence
-        article = await self._extract_with_newspaper3k(url)
+        # Use base_url if provided, otherwise use the article URL
+        base_url = base_url or url
         
-        if not article or not article.content.strip():
-            article = await self._extract_with_trafilatura(url)
-            
-        if not article or not article.content.strip():
-            article = await self._extract_with_goose(url)
-            
-        if not article or not article.content.strip():
-            article = await self._extract_with_readability(url)
-            
-        if not article or not article.content.strip():
-            article = await self._extract_with_beautifulsoup(url)
-            
-        # If all methods failed, return None
-        if not article or not article.content.strip():
-            return None
-            
-        # Detect language if not already set
-        if not hasattr(article, 'language') or not article.language:
-            article.language = self._detect_language(article.content)
-            
-        return article
+        # Try different scraping methods
+        methods = [
+            self._scrape_with_newspaper,
+            self._scrape_with_trafilatura,
+            self._scrape_with_goose,
+            self._scrape_with_readability,
+            self._scrape_with_playwright
+        ]
+        
+        for method in methods:
+            try:
+                article = await method(url)
+                if article and article.get("content"):
+                    # Add source domain
+                    article["source_domain"] = extract_domain(url)
+                    
+                    # Extract logo if not already present
+                    if not article.get("logo_url"):
+                        article["logo_url"] = await self._extract_logo(url)
+                    
+                    return article
+            except Exception as e:
+                logger.warning(f"Method {method.__name__} failed for {url}: {str(e)}")
+        
+        # All methods failed
+        logger.error(f"All scraping methods failed for {url}")
+        return None
     
-    async def _extract_with_newspaper3k(self, url: str) -> Optional[Article]:
-        """Extract article using newspaper3k library."""
+    async def _scrape_with_newspaper(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Scrape an article using newspaper3k.
+        
+        Args:
+            url: URL of the article to scrape
+            
+        Returns:
+            Article data or None if scraping fails
+        """
         try:
-            news_article = NewspaperArticle(url)
-            news_article.download()
-            news_article.parse()
+            # Download and parse article
+            article = NewspaperArticle(url)
+            article.download()
+            article.parse()
             
-            # Format publication date if available
-            pub_date = None
-            if news_article.publish_date:
-                pub_date = news_article.publish_date.strftime('%Y-%m-%d')
+            # Extract data
+            data = {
+                "title": article.title,
+                "content": article.text,
+                "url": url,
+                "language": article.meta_lang or self._detect_language(article.text),
+                "publication_date": article.publish_date.isoformat() if article.publish_date else None,
+                "image_urls": [article.top_image] if article.top_image else []
+            }
             
-            return Article(
-                title=news_article.title,
-                content=news_article.text,
-                publication_date=pub_date,
-                url=url,
-                language=news_article.meta_lang or self._detect_language(news_article.text)
-            )
+            # Add all images
+            if article.images:
+                data["image_urls"] = list(article.images)
+            
+            return data
+        
         except Exception as e:
-            logger.warning(f"newspaper3k extraction failed for {url}: {str(e)}")
+            logger.warning(f"Newspaper scraping failed for {url}: {str(e)}")
             return None
     
-    async def _extract_with_trafilatura(self, url: str) -> Optional[Article]:
-        """Extract article using trafilatura library."""
+    async def _scrape_with_trafilatura(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Scrape an article using trafilatura.
+        
+        Args:
+            url: URL of the article to scrape
+            
+        Returns:
+            Article data or None if scraping fails
+        """
         try:
+            # Fetch and extract content
             downloaded = fetch_url(url)
             if not downloaded:
                 return None
-                
-            extracted_text = extract(downloaded, include_comments=False, include_tables=False)
-            if not extracted_text:
+            
+            result = extract(downloaded, include_images=True, include_links=False, output_format="json")
+            if not result:
                 return None
-                
-            # Try to extract title from HTML
-            soup = BeautifulSoup(downloaded, 'html.parser')
-            title = soup.title.string if soup.title else "Unknown Title"
             
-            # Try to find publication date
-            pub_date = self._extract_date_from_html(soup)
+            import json
+            result_dict = json.loads(result)
             
-            return Article(
-                title=title,
-                content=extracted_text,
-                publication_date=pub_date,
-                url=url,
-                language=self._detect_language(extracted_text)
-            )
+            # Extract data
+            data = {
+                "title": result_dict.get("title", ""),
+                "content": result_dict.get("text", ""),
+                "url": url,
+                "language": result_dict.get("language") or self._detect_language(result_dict.get("text", "")),
+                "publication_date": result_dict.get("date"),
+                "image_urls": []
+            }
+            
+            # Extract images
+            if "images" in result_dict and result_dict["images"]:
+                data["image_urls"] = result_dict["images"]
+            
+            return data
+        
         except Exception as e:
-            logger.warning(f"trafilatura extraction failed for {url}: {str(e)}")
+            logger.warning(f"Trafilatura scraping failed for {url}: {str(e)}")
             return None
     
-    async def _extract_with_goose(self, url: str) -> Optional[Article]:
-        """Extract article using goose3 library."""
-        try:
-            article = self.goose.extract(url=url)
+    async def _scrape_with_goose(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Scrape an article using goose3.
+        
+        Args:
+            url: URL of the article to scrape
             
-            if not article.cleaned_text:
-                return None
-                
-            # Format publication date if available
-            pub_date = None
-            if article.publish_date:
-                pub_date = article.publish_date.strftime('%Y-%m-%d')
-                
-            return Article(
-                title=article.title,
-                content=article.cleaned_text,
-                publication_date=pub_date,
-                url=url,
-                language=article.meta_lang or self._detect_language(article.cleaned_text)
-            )
+        Returns:
+            Article data or None if scraping fails
+        """
+        try:
+            # Extract article
+            with Goose() as g:
+                article = g.extract(url=url)
+            
+            # Extract data
+            data = {
+                "title": article.title,
+                "content": article.cleaned_text,
+                "url": url,
+                "language": article.meta_lang or self._detect_language(article.cleaned_text),
+                "publication_date": article.publish_date,
+                "image_urls": [article.top_image.src] if article.top_image else []
+            }
+            
+            # Add all images
+            if article.images:
+                data["image_urls"] = [img.src for img in article.images]
+            
+            return data
+        
         except Exception as e:
-            logger.warning(f"goose3 extraction failed for {url}: {str(e)}")
+            logger.warning(f"Goose scraping failed for {url}: {str(e)}")
             return None
     
-    async def _extract_with_readability(self, url: str) -> Optional[Article]:
-        """Extract article using readability-lxml library."""
+    async def _scrape_with_readability(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Scrape an article using readability-lxml.
+        
+        Args:
+            url: URL of the article to scrape
+            
+        Returns:
+            Article data or None if scraping fails
+        """
         try:
-            html = await self._fetch_html_with_js_rendering(url)
-            if not html:
-                return None
-                
+            # Fetch content
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    html = await response.text()
+            
+            # Parse with readability
             doc = Document(html)
+            
+            # Extract content
+            title = doc.title()
             content = doc.summary()
             
-            # Clean HTML tags from content
-            soup = BeautifulSoup(content, 'html.parser')
-            cleaned_text = soup.get_text(separator='\n', strip=True)
+            # Clean content with BeautifulSoup
+            soup = BeautifulSoup(content, "html.parser")
+            text = soup.get_text(separator="\n\n")
             
-            # Extract title
-            title = doc.title()
+            # Extract images
+            image_urls = []
+            for img in soup.find_all("img"):
+                if img.get("src"):
+                    image_urls.append(img["src"])
             
-            # Try to find publication date
-            pub_date = self._extract_date_from_html(BeautifulSoup(html, 'html.parser'))
+            # Extract data
+            data = {
+                "title": title,
+                "content": text,
+                "url": url,
+                "language": self._detect_language(text),
+                "publication_date": None,  # Readability doesn't extract publication date
+                "image_urls": image_urls
+            }
             
-            return Article(
-                title=title,
-                content=cleaned_text,
-                publication_date=pub_date,
-                url=url,
-                language=self._detect_language(cleaned_text)
-            )
+            return data
+        
         except Exception as e:
-            logger.warning(f"readability-lxml extraction failed for {url}: {str(e)}")
+            logger.warning(f"Readability scraping failed for {url}: {str(e)}")
             return None
     
-    async def _extract_with_beautifulsoup(self, url: str) -> Optional[Article]:
-        """Extract article using BeautifulSoup as a last resort."""
-        try:
-            html = await self._fetch_html_with_js_rendering(url)
-            if not html:
-                return None
-                
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Remove unwanted elements
-            for element in soup.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
-                element.decompose()
-            
-            # Extract title
-            title = soup.title.string if soup.title else "Unknown Title"
-            
-            # Try to find main content
-            main_content = None
-            for tag in ['article', 'main', '.content', '#content', '.post', '.article']:
-                if tag.startswith('.') or tag.startswith('#'):
-                    main_content = soup.select_one(tag)
-                else:
-                    main_content = soup.find(tag)
-                    
-                if main_content:
-                    break
-            
-            # If no main content found, use body
-            if not main_content:
-                main_content = soup.body
-                
-            # Extract text
-            if main_content:
-                content = main_content.get_text(separator='\n', strip=True)
-            else:
-                content = soup.get_text(separator='\n', strip=True)
-                
-            # Try to find publication date
-            pub_date = self._extract_date_from_html(soup)
-            
-            # Only return if we have meaningful content
-            if len(content) > 100:  # Arbitrary threshold to avoid empty or too short content
-                return Article(
-                    title=title,
-                    content=content,
-                    publication_date=pub_date,
-                    url=url,
-                    language=self._detect_language(content)
-                )
-            return None
-        except Exception as e:
-            logger.warning(f"BeautifulSoup extraction failed for {url}: {str(e)}")
-            return None
-    
-    async def _fetch_html_with_js_rendering(self, url: str) -> Optional[str]:
+    async def _scrape_with_playwright(self, url: str) -> Optional[Dict[str, Any]]:
         """
-        Fetch HTML content with JavaScript rendering support using Playwright.
-        Falls back to simple HTTP request if Playwright fails.
+        Scrape an article using playwright for JavaScript-rendered websites.
+        
+        Args:
+            url: URL of the article to scrape
+            
+        Returns:
+            Article data or None if scraping fails
         """
-        # First try with Playwright for JS rendering
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
-                
-                # Set timeout and user agent
-                page.set_default_timeout(30000)  # 30 seconds
-                await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"})
-                
-                # Navigate to the URL
+            # Initialize browser if not already initialized
+            if not self.browser:
+                await self._init_browser()
+            
+            # Create a new page
+            page = await self.browser.new_page()
+            
+            try:
+                # Navigate to URL
                 await page.goto(url, wait_until="networkidle")
                 
-                # Wait a bit for any lazy-loaded content
-                await asyncio.sleep(2)
+                # Extract content
+                title = await page.title()
                 
-                # Get the HTML content
-                content = await page.content()
+                # Extract text content
+                content = await page.evaluate("""
+                    () => {
+                        // Try to find article content
+                        const selectors = [
+                            'article',
+                            '[role="article"]',
+                            '.post-content',
+                            '.article-content',
+                            '.entry-content',
+                            '.content',
+                            'main'
+                        ];
+                        
+                        for (const selector of selectors) {
+                            const element = document.querySelector(selector);
+                            if (element) {
+                                return element.innerText;
+                            }
+                        }
+                        
+                        // Fallback to body content
+                        return document.body.innerText;
+                    }
+                """)
                 
-                # Close browser
-                await browser.close()
+                # Extract images
+                image_urls = await page.evaluate("""
+                    () => {
+                        const images = Array.from(document.querySelectorAll('img'));
+                        return images
+                            .filter(img => img.src && img.width > 100 && img.height > 100)
+                            .map(img => img.src);
+                    }
+                """)
                 
-                return content
+                # Extract publication date
+                publication_date = await page.evaluate("""
+                    () => {
+                        // Try to find publication date in meta tags
+                        const metaSelectors = [
+                            'meta[property="article:published_time"]',
+                            'meta[name="publication_date"]',
+                            'meta[name="date"]',
+                            'meta[name="pubdate"]'
+                        ];
+                        
+                        for (const selector of metaSelectors) {
+                            const element = document.querySelector(selector);
+                            if (element && element.content) {
+                                return element.content;
+                            }
+                        }
+                        
+                        // Try to find publication date in time elements
+                        const timeElements = Array.from(document.querySelectorAll('time'));
+                        for (const time of timeElements) {
+                            if (time.dateTime) {
+                                return time.dateTime;
+                            }
+                        }
+                        
+                        return null;
+                    }
+                """)
+                
+                # Extract logo
+                logo_url = await page.evaluate("""
+                    () => {
+                        // Try to find logo in link tags
+                        const linkSelectors = [
+                            'link[rel="icon"]',
+                            'link[rel="shortcut icon"]',
+                            'link[rel="apple-touch-icon"]'
+                        ];
+                        
+                        for (const selector of linkSelectors) {
+                            const element = document.querySelector(selector);
+                            if (element && element.href) {
+                                return element.href;
+                            }
+                        }
+                        
+                        // Try to find logo in meta tags
+                        const metaSelectors = [
+                            'meta[property="og:image"]',
+                            'meta[name="twitter:image"]'
+                        ];
+                        
+                        for (const selector of metaSelectors) {
+                            const element = document.querySelector(selector);
+                            if (element && element.content) {
+                                return element.content;
+                            }
+                        }
+                        
+                        return null;
+                    }
+                """)
+                
+                # Extract data
+                data = {
+                    "title": title,
+                    "content": content,
+                    "url": url,
+                    "language": self._detect_language(content),
+                    "publication_date": publication_date,
+                    "image_urls": image_urls,
+                    "logo_url": logo_url
+                }
+                
+                return data
+                
+            finally:
+                # Close the page
+                await page.close()
+        
         except Exception as e:
-            logger.warning(f"Playwright rendering failed for {url}: {str(e)}, falling back to simple fetch")
+            logger.warning(f"Playwright scraping failed for {url}: {str(e)}")
+            return None
+    
+    async def _extract_logo(self, url: str) -> Optional[str]:
+        """
+        Extract website logo from a URL.
+        
+        Args:
+            url: URL to extract logo from
             
-            # Fallback to simple fetch
-            try:
-                from urllib.request import Request, urlopen
-                
-                req = Request(
-                    url,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-                )
-                with urlopen(req, timeout=30) as response:
-                    return response.read().decode('utf-8', errors='replace')
-            except Exception as fetch_e:
-                logger.error(f"Simple fetch also failed for {url}: {str(fetch_e)}")
-                return None
+        Returns:
+            Logo URL or None if extraction fails
+        """
+        try:
+            # Parse URL to get domain
+            parsed_url = urlparse(url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            
+            # Try to get favicon
+            favicon_url = f"{base_url}/favicon.ico"
+            
+            # Check if favicon exists
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.head(favicon_url) as response:
+                    if response.status == 200:
+                        return favicon_url
+            
+            # If favicon doesn't exist, try to extract from HTML
+            if self.browser:
+                page = await self.browser.new_page()
+                try:
+                    await page.goto(base_url, wait_until="domcontentloaded")
+                    
+                    # Extract logo
+                    logo_url = await page.evaluate("""
+                        () => {
+                            // Try to find logo in link tags
+                            const linkSelectors = [
+                                'link[rel="icon"]',
+                                'link[rel="shortcut icon"]',
+                                'link[rel="apple-touch-icon"]'
+                            ];
+                            
+                            for (const selector of linkSelectors) {
+                                const element = document.querySelector(selector);
+                                if (element && element.href) {
+                                    return element.href;
+                                }
+                            }
+                            
+                            // Try to find logo in meta tags
+                            const metaSelectors = [
+                                'meta[property="og:image"]',
+                                'meta[name="twitter:image"]'
+                            ];
+                            
+                            for (const selector of metaSelectors) {
+                                const element = document.querySelector(selector);
+                                if (element && element.content) {
+                                    return element.content;
+                                }
+                            }
+                            
+                            return null;
+                        }
+                    """)
+                    
+                    return logo_url
+                    
+                finally:
+                    await page.close()
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Logo extraction failed for {url}: {str(e)}")
+            return None
     
     def _detect_language(self, text: str) -> str:
         """
-        Detect the language of the text using multiple libraries for reliability.
+        Detect the language of a text using multiple libraries.
         
         Args:
             text: Text to detect language for
             
         Returns:
-            ISO 639-1 language code (e.g., 'en', 'fr')
+            Language code (ISO 639-1)
         """
-        if not text or len(text.strip()) < 10:
-            return "unknown"
-            
-        # Try langdetect first
+        if not text:
+            return "en"  # Default to English
+        
         try:
+            # Try langdetect first
             return langdetect.detect(text)
-        except Exception:
-            # Fallback to langid
+        except:
             try:
+                # Fallback to langid
                 lang, _ = langid.classify(text)
                 return lang
-            except Exception:
-                return "unknown"
+            except:
+                # Default to English
+                return "en"
     
-    def _extract_date_from_html(self, soup: BeautifulSoup) -> Optional[str]:
-        """
-        Extract publication date from HTML using common patterns.
-        
-        Args:
-            soup: BeautifulSoup object of the HTML
-            
-        Returns:
-            Publication date in YYYY-MM-DD format or None if not found
-        """
-        # Look for common date meta tags
-        meta_tags = [
-            {'property': 'article:published_time'},
-            {'name': 'publication_date'},
-            {'name': 'date'},
-            {'name': 'pubdate'},
-            {'itemprop': 'datePublished'},
-            {'name': 'DC.date.issued'}
-        ]
-        
-        for meta_attrs in meta_tags:
-            meta_tag = soup.find('meta', attrs=meta_attrs)
-            if meta_tag and meta_tag.get('content'):
-                try:
-                    # Try to parse the date
-                    date_str = meta_tag.get('content')
-                    date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    return date_obj.strftime('%Y-%m-%d')
-                except (ValueError, AttributeError):
-                    continue
-        
-        # Look for time tags
-        time_tag = soup.find('time')
-        if time_tag and time_tag.get('datetime'):
-            try:
-                date_str = time_tag.get('datetime')
-                date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                return date_obj.strftime('%Y-%m-%d')
-            except (ValueError, AttributeError):
-                pass
-        
-        # Look for common date patterns in the text
-        date_patterns = [
-            r'(\d{4}-\d{2}-\d{2})',  # YYYY-MM-DD
-            r'(\d{2}/\d{2}/\d{4})',  # MM/DD/YYYY
-            r'(\d{2}\.\d{2}\.\d{4})'  # DD.MM.YYYY
-        ]
-        
-        for pattern in date_patterns:
-            match = re.search(pattern, str(soup))
-            if match:
-                date_str = match.group(1)
-                try:
-                    if '-' in date_str:
-                        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                    elif '/' in date_str:
-                        date_obj = datetime.strptime(date_str, '%m/%d/%Y')
-                    elif '.' in date_str:
-                        date_obj = datetime.strptime(date_str, '%d.%m.%Y')
-                    return date_obj.strftime('%Y-%m-%d')
-                except ValueError:
-                    continue
-        
-        return None
+    async def _init_browser(self):
+        """Initialize the playwright browser."""
+        try:
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.launch(headless=True)
+            logger.info("Playwright browser initialized")
+        except Exception as e:
+            logger.error(f"Error initializing playwright browser: {str(e)}")
+            raise
     
-    def _is_likely_article_url(self, url: str) -> bool:
-        """
-        Check if a URL is likely to point to an article.
+    async def close(self):
+        """Close the playwright browser."""
+        if self.browser:
+            await self.browser.close()
+            self.browser = None
         
-        Args:
-            url: URL to check
-            
-        Returns:
-            True if URL likely points to an article, False otherwise
-        """
-        # Common article URL patterns
-        article_indicators = [
-            r'/article/', r'/story/', r'/news/', r'/post/',
-            r'/\d{4}/\d{2}/', r'/blog/', r'/opinion/',
-            r'\.html$', r'\.htm$', r'/\d+$'
-        ]
-        
-        # Check if URL matches any article pattern
-        for pattern in article_indicators:
-            if re.search(pattern, url):
-                return True
-                
-        return False
+        if self.playwright:
+            await self.playwright.stop()
+            self.playwright = None
